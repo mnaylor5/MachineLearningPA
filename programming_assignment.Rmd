@@ -1,0 +1,142 @@
+---
+title: "Machine Learning Final Project"
+author: "Mitch Naylor"
+date: "April 15, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(plyr)
+library(dplyr)
+library(caret)
+library(xgboost)
+setwd('C:/Users/Mitch/Desktop/JHU/Machine Learning/week 4/programming assignment')
+```
+
+## Introduction
+In this study, we will use data collected from fitness trackers to predict 
+the manner in which the user is performing an exercise. More information 
+about the dataset can be found [at this link](http://groupware.les.inf.puc-rio.br/har).
+
+## Download, Read in, and Pre-Process the Data
+We'll begin by downloading the data directly and reading it into R. After 
+reading it into the R session, I create a data frame of predictor variables, 
+convert them to numeric, and encode null values as `-1e6`. Since I intend to 
+use a gradient-boosted tree-based model, all of the features must be numeric,
+and null values must be encoded. After that, I convert the `classe` variable 
+to a factor, which will be passed through `caret::train` 
+as the target variable. 
+
+```{r get data}
+if(!file.exists('train.csv')){
+  download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv',
+              destfile = 'train.csv')
+}
+if(!file.exists('test.csv')){
+  download.file('https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv',
+              destfile = 'test.csv')
+}
+train <- fread('train.csv', na.strings = c('','NA', '#DIV/0!'))
+test <- fread('test.csv', na.strings = c('','NA', '#DIV/0!'))
+
+# Select only valid predictors
+predictors <- train %>% select(-c(V1, user_name, raw_timestamp_part_1,
+                               raw_timestamp_part_2, cvtd_timestamp,
+                               new_window, num_window, skewness_roll_belt.1, classe))
+
+# Convert predictors to numeric for XGBoost
+predictors <- as.data.frame(lapply(predictors, as.numeric))
+
+# Fill in null values
+predictors[is.na(predictors)] <- -1e6
+
+# Factor dependent variable to pass through caret::train
+predictors$target <- as.factor(train$classe)
+```
+
+## Modeling 
+Here, I use the `caret` package to fit a cross-validated GBM. I use four
+folds to validate the `XGBoost` model, which helps prevent overfitting. I 
+specifically chose the `XGBoost` package because it provides powerful 
+options for multi-level classification problems. More information about 
+the `XGBoost` package can be found 
+[here](https://cran.r-project.org/web/packages/xgboost/xgboost.pdf).
+
+```{r fit gbm}
+# Select GBM parameters
+set.seed(100)
+param_grid <- expand.grid(
+  eta = 0.26, 
+  nrounds = 400,
+  min_child_weight = 100,
+  gamma = 0.8,
+  subsample = 1,
+  colsample_bytree = 0.8,
+  max_depth = 7
+)
+
+# 4-fold cross-validation, allowing for parallel computation
+train_control <- trainControl(method = 'cv',
+                              number = 4,
+                              verboseIter = F,
+                              classProbs = T,
+                              allowParallel = T)
+
+# Train the model
+xgb <- train(target ~ .,
+             data = predictors,
+             method = 'xgbTree',
+             tuneGrid = param_grid,
+             trControl = train_control)
+
+# Save the train output
+saveRDS(xgb, file = 'train_output.RDS')
+
+# See the results
+xgb
+```
+
+As we can see, the model has an accuracy of `r scales::percent(xgb$results$Accuracy)` 
+on the cross-validated training dataset, which is quite good, considering that 
+building the model took about `r round(xgb$times$everything[3] / 60, 2)` minutes.  
+
+Since the model accuracy is around 98.5% using 4-fold cross-validation, we can 
+likely expect the out-of-sample error to be somewhere between 95-98%. Using 
+cross-validation helps avoid overfitting, since a portion of the training data
+is withheld at each fold.
+
+Like many machine learning modeling techniques, GBMs are somewhat black-boxy,
+which means that we are not able to get a high level of interpretability --- however, 
+we *can* get an idea of which features contribute the most across the 
+trees in the model. 
+
+```{r var imp, fig.height=4, fig.width=5}
+importance <- xgb.importance(xgb$finalModel, feature_names = colnames(predictors))
+xgb.ggplot.importance(importance[1:25,]) + theme(legend.position = 'bottom')
+```
+
+The most "important" predictor in this model is `r importance$Feature[1]`. 
+The measure of importance used for GBMs is gain, which is simply the 
+observed improvement in accuracy whenever a specific predictor is added 
+to each branch on which it appears.  
+
+### Predicting Test Data
+Since we're comfortable with this model's performance on training data, 
+I will now use it to predict the outcome of the 20 test cases. 
+
+```{r test data}
+# Apply the same pre-processing
+test_predictors <- test %>% select(-c(V1, user_name, raw_timestamp_part_1,
+                                      raw_timestamp_part_2, cvtd_timestamp,
+                                      new_window, num_window, skewness_roll_belt.1))
+test_predictors <- as.data.frame(lapply(test_predictors, as.numeric))
+test_predictors[is.na(test_predictors)] <- -1e6
+
+# Store the predictions
+test$predicted <- predict.train(xgb, newdata = test_predictors)
+
+# Save predictions
+write.csv(test[,c(1,161)], file = 'test_predictions.csv', row.names = F)
+```
